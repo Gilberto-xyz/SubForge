@@ -542,11 +542,64 @@ def multiplexa(
             for t in subs
         )
         print(c("-> Mux:", Colors.CYAN, colors), video.name, "+", detalles)
-    proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-    )
 
-    output = proc.stdout or ""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+
+    output_chunks: list[str] = []
+    buffer = ""
+    progress_re = re.compile(r"(\d{1,3})(?:\.\d+)?%")
+    showed_progress = False
+
+    def _handle_line(line: str) -> None:
+        nonlocal showed_progress
+        output_chunks.append(line)
+        m = progress_re.search(line)
+        if m:
+            try:
+                pct = float(m.group(1))
+            except ValueError:
+                pct = None
+            if pct is not None:
+                pct = min(100.0, max(0.0, pct))
+                showed_progress = True
+                print(f"\r  Progreso mux: {pct:5.1f}%".ljust(80), end="", flush=True)
+            return
+        if display and verbose:
+            print(line.rstrip("\r\n"))
+        elif verbose:
+            print(line.rstrip("\r\n"))
+
+    while True:
+        chunk = proc.stdout.read(1)
+        if chunk == "" and proc.poll() is not None:
+            if buffer:
+                _handle_line(buffer)
+                buffer = ""
+            break
+        if not chunk:
+            continue
+        buffer += chunk
+        if chunk in {"\n", "\r"}:
+            _handle_line(buffer)
+            buffer = ""
+
+    proc.wait()
+    if buffer:
+        _handle_line(buffer)
+
+    if showed_progress:
+        print("\r" + " " * 120, end="\r", flush=True)
+
+    output = "".join(output_chunks)
     had_warnings = proc.returncode == 1 or ("Advertencia:" in output or "Warning:" in output)
 
     log_path: Optional[pathlib.Path] = None
