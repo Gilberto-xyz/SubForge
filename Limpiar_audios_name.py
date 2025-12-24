@@ -18,19 +18,66 @@ from __future__ import annotations
 ###############################################################################
 
 import argparse
+import inspect
 import json
 import logging
+import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 # Barra de progreso (opcional)
 try:
     from tqdm import tqdm  # type: ignore
 except Exception:  # pragma: no cover
     tqdm = None  # type: ignore
+
+# Colores de consola (opcional)
+try:
+    import colorama  # type: ignore
+except Exception:  # pragma: no cover
+    colorama = None  # type: ignore
+
+def _enable_windows_ansi() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        enabled = False
+        for handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                if kernel32.SetConsoleMode(handle, mode.value | 0x0004):
+                    enabled = True
+        return enabled
+    except Exception:
+        return False
+
+
+COLOR_ENABLED = False
+if colorama:
+    try:
+        colorama.just_fix_windows_console()
+        COLOR_ENABLED = True
+    except Exception:
+        COLOR_ENABLED = False
+elif os.name != "nt":
+    COLOR_ENABLED = True
+else:
+    COLOR_ENABLED = _enable_windows_ansi()
+
+ANSI_RESET = "\x1b[0m"
+ANSI_GREEN = "\x1b[32m"
+ANSI_YELLOW = "\x1b[33m"
+ANSI_CYAN = "\x1b[36m"
+ANSI_MAGENTA = "\x1b[35m"
+ANSI_RED = "\x1b[31m"
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 ###############################################################################
 # Configuración
@@ -44,6 +91,91 @@ OUTPUT_FOLDER = "filtrados"
 ORIGINALS_FOLDER = "ORIGINAL"
 
 DEFAULT_BRAND = "GDriveLatinoHD"  # texto a insertar en nombres de pista
+
+PROGRESS_RE = re.compile(r"(\d{1,3})%")
+
+
+def _color(text: str, color: str) -> str:
+    return f"{color}{text}{ANSI_RESET}" if COLOR_ENABLED else text
+
+
+def _tqdm_supports_colour() -> bool:
+    if not tqdm:
+        return False
+    try:
+        return "colour" in inspect.signature(tqdm).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _visible_len(text: str) -> int:
+    return len(ANSI_RE.sub("", text))
+
+
+class SimpleBar:
+    def __init__(
+        self,
+        total: int,
+        desc: str,
+        unit: str,
+        inplace: bool,
+        show_count: bool,
+        width: int = 24,
+        stream=None,
+    ) -> None:
+        self.total = max(int(total), 0)
+        self.n = 0
+        self.desc = desc
+        self.unit = unit
+        self.width = max(int(width), 10)
+        self.inplace = inplace
+        self.show_count = show_count
+        self.stream = stream or sys.stdout
+        self.last_len = 0
+        self.enabled = True
+        if hasattr(self.stream, "isatty") and not self.stream.isatty():
+            self.inplace = False
+
+    def set_description(self, desc: str) -> None:
+        self.desc = desc
+
+    def _render(self) -> str:
+        if self.total <= 0:
+            current = max(self.n, 0)
+            pct = 0
+            filled = 0
+        else:
+            current = min(max(self.n, 0), self.total)
+            pct = int((current / self.total) * 100)
+            filled = int((current / self.total) * self.width)
+        bar = ("#" * filled) + ("-" * (self.width - filled))
+        if self.show_count:
+            suffix = f"{current}/{self.total} {self.unit}".strip()
+            return f"{self.desc} [{bar}] {suffix} ({pct:3d}%)"
+        return f"{self.desc} [{bar}] {pct:3d}%"
+
+    def refresh(self) -> None:
+        if not self.enabled:
+            return
+        msg = self._render()
+        visible_len = _visible_len(msg)
+        if self.inplace:
+            pad = max(self.last_len - visible_len, 0)
+            self.stream.write("\r" + msg + (" " * pad))
+            self.stream.flush()
+            self.last_len = max(self.last_len, visible_len)
+        else:
+            self.stream.write(msg + "\n")
+            self.stream.flush()
+
+    def update(self, n: int) -> None:
+        self.n = min(self.total, self.n + int(n))
+        self.refresh()
+
+    def close(self) -> None:
+        if self.inplace and self.enabled:
+            self.stream.write("\n")
+            self.stream.flush()
 
 ###############################################################################
 # Utilidades de normalización (tomadas/adaptadas de Limpiar_Audios.py)
@@ -355,6 +487,7 @@ def run_mkvmerge(
     sub_ids: List[str],
     audio_es_id: str | None = None,
     sub_es_forzado_id: str | None = None,
+    progress_cb: Callable[[int], None] | None = None,
 ) -> bool:
     cmd = [_resolve_bin(MKVMERGE, "mkvmerge"), "--no-global-tags", "-o", str(dst)]
     if video_ids:
@@ -374,10 +507,41 @@ def run_mkvmerge(
     cmd.append(str(src))
     logging.debug("mkvmerge CMD: %s", " ".join(str(x) for x in cmd))
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return True
-    except subprocess.CalledProcessError as exc:
-        logging.error("mkvmerge error (%s): %s", src.name, exc.stderr.decode("utf-8", "ignore"))
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        output: List[str] = []
+        last_pct = -1
+        if progress_cb:
+            progress_cb(0)
+        if proc.stdout:
+            for line in proc.stdout:
+                output.append(line)
+                match = PROGRESS_RE.search(line)
+                if match:
+                    try:
+                        pct = int(match.group(1))
+                    except ValueError:
+                        continue
+                    if 0 <= pct <= 100 and pct != last_pct:
+                        last_pct = pct
+                        if progress_cb:
+                            progress_cb(pct)
+        ret = proc.wait()
+        if ret == 0:
+            if progress_cb and last_pct < 100:
+                progress_cb(100)
+            return True
+        logging.error("mkvmerge error (%s): %s", src.name, "".join(output).strip())
+        return False
+    except OSError as exc:
+        logging.error("mkvmerge error (%s): %s", src.name, exc)
         return False
 
 
@@ -494,7 +658,12 @@ def list_target_files(folder: pathlib.Path):
             yield p
 
 
-def process_video(path: pathlib.Path, workdir: pathlib.Path, output_in_root: bool) -> Tuple[pathlib.Path | None, str]:
+def process_video(
+    path: pathlib.Path,
+    workdir: pathlib.Path,
+    output_in_root: bool,
+    progress_cb: Callable[[int], None] | None = None,
+) -> Tuple[pathlib.Path | None, str]:
     """Filtra pistas como el script base y devuelve el destino (sin renombrar metadatos)."""
     originals = workdir / ORIGINALS_FOLDER
     originals.mkdir(exist_ok=True)
@@ -523,7 +692,16 @@ def process_video(path: pathlib.Path, workdir: pathlib.Path, output_in_root: boo
         out_root.mkdir(exist_ok=True)
         dst = out_root / f"{src.stem} (filtered){src.suffix}"
 
-    ok = run_mkvmerge(src, dst, [t["id"] for t in v_tracks], a_ids, s_ids, audio_es_id, sub_es_forzado_id)
+    ok = run_mkvmerge(
+        src,
+        dst,
+        [t["id"] for t in v_tracks],
+        a_ids,
+        s_ids,
+        audio_es_id,
+        sub_es_forzado_id,
+        progress_cb=progress_cb,
+    )
     if not ok:
         return None, "error"
     return dst, "filtrado"
@@ -572,25 +750,81 @@ def main():
     # Política de salida: si solo 1 archivo => raíz; si más de 2 => carpeta
     output_in_root = total_files <= 2
 
-    steps_total = total_files * 2  # mux + rename por archivo
-    pbar = tqdm(total=steps_total, desc="Preparando", unit="paso") if tqdm else None
+    steps_total = total_files  # avance global por archivo
+    use_tqdm = bool(tqdm)
+    if use_tqdm and hasattr(sys.stderr, "isatty") and not sys.stderr.isatty():
+        use_tqdm = False
+    tqdm_colour_ok = _tqdm_supports_colour() if use_tqdm else False
+    pbar_kwargs = {"colour": "cyan"} if tqdm_colour_ok else {}
+    if use_tqdm:
+        pbar = tqdm(
+            total=steps_total,
+            desc=_color("Global", ANSI_CYAN),
+            unit="archivo",
+            **pbar_kwargs,
+        )
+    else:
+        pbar = SimpleBar(
+            total=steps_total,
+            desc=_color("Global", ANSI_CYAN),
+            unit="archivo",
+            inplace=False,
+            show_count=True,
+        )
+        pbar.refresh()
 
     ok_total = 0
     for idx, f in enumerate(files, start=1):
         name = f.name
         if args.verbose or not pbar:
-            print(f"[{idx}/{total_files}] Mux: {name}")
-        if pbar:
-            pbar.set_description(f"Mux: {name[:40]}")
-        dst, status = process_video(f, workdir=workdir, output_in_root=output_in_root)
-        if pbar:
-            pbar.update(1)
+            print(f"[{idx}/{total_files}] {_color('Mux', ANSI_MAGENTA)}: {name}")
+        if pbar and use_tqdm:
+            pbar.set_description(_color(f"Mux: {name[:40]}", ANSI_CYAN))
+
+        mux_pbar = None
+        if use_tqdm:
+            mux_kwargs = {"colour": "magenta"} if tqdm_colour_ok else {}
+            mux_pbar = tqdm(
+                total=100,
+                desc=_color(f"Mux: {name[:40]}", ANSI_MAGENTA),
+                unit="%",
+                leave=False,
+                **mux_kwargs,
+            )
+        else:
+            mux_pbar = SimpleBar(
+                total=100,
+                desc=_color(f"Mux: {name[:40]}", ANSI_MAGENTA),
+                unit="%",
+                inplace=True,
+                show_count=False,
+            )
+
+        def _mux_progress(pct: int):
+            if mux_pbar:
+                mux_pbar.n = pct
+                mux_pbar.refresh()
+            elif args.verbose:
+                print(f"    {_color('Progreso mux', ANSI_MAGENTA)}: {pct}%")
+
+        dst, status = process_video(
+            f,
+            workdir=workdir,
+            output_in_root=output_in_root,
+            progress_cb=_mux_progress,
+        )
+        if mux_pbar:
+            if status == "filtrado":
+                mux_pbar.n = 100
+                mux_pbar.refresh()
+            mux_pbar.close()
         if status != "filtrado" or not dst:
             if args.verbose or not pbar:
-                print(f"    Error al filtrar: {name}")
+                print(f"    {_color('Error', ANSI_RED)} al filtrar: {name}")
             # aún contamos paso de rename para no desbalancear la barra
             if pbar:
-                pbar.set_description(f"Meta: {name[:40]}")
+                if use_tqdm:
+                    pbar.set_description(_color(f"Meta: {name[:40]}", ANSI_CYAN))
                 pbar.update(1)
             continue
 
@@ -598,9 +832,9 @@ def main():
         rename_ok = True
         if dst.suffix.lower() in {".mkv", ".webm"}:
             if args.verbose or not pbar:
-                print(f"[{idx}/{total_files}] Meta: {dst.name}")
-            if pbar:
-                pbar.set_description(f"Meta: {dst.name[:40]}")
+                print(f"[{idx}/{total_files}] {_color('Meta', ANSI_YELLOW)}: {dst.name}")
+            if pbar and use_tqdm:
+                pbar.set_description(_color(f"Meta: {dst.name[:40]}", ANSI_CYAN))
             rename_ok = mkvpropedit_rename(dst, brand=args.brand, set_title=True, verbose=False)
         else:
             logging.info("%s: contenedor no Matroska; se omitió renombrado de metadatos.", dst.name)
@@ -609,8 +843,12 @@ def main():
         ok_total += 1 if rename_ok else 0
 
         # Notificación breve por archivo
-        msg = ("OK "+dst.name) if rename_ok else ("ERROR "+dst.name)
-        if pbar and tqdm:
+        msg = (
+            f"{_color('OK', ANSI_GREEN)} {dst.name}"
+            if rename_ok
+            else f"{_color('ERROR', ANSI_RED)} {dst.name}"
+        )
+        if pbar and use_tqdm:
             tqdm.write(msg)
         else:
             print(msg)
