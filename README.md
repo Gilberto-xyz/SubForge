@@ -11,14 +11,6 @@ Scripts canónicos (nuevos):
 - `unir_subs.py`: agrega subtítulos externos (`.srt`/`.ass`) a videos existentes.
 - `extraer_subtitulos.py`: extrae subtítulos internos y soporta PGS (`.sup`) con OCR opcional.
 
-Alias de compatibilidad (nombres antiguos, siguen funcionando):
-
-- `Limpiar_audios_name.py` -> `limpiar_tracks.py`
-- `Mux_mp4_mkv.py` -> `convertir_mp4_a_mkv.py`
-- `Merge_Subs_v3.py` -> `unir_subs.py`
-- `Extraer_Subs_PGS.py` -> `extraer_subtitulos.py`
-- `Extraer_Subs.py` -> `extraer_subtitulos.py`
-
 ## Requisitos
 
 - Python 3.10+ (recomendado).
