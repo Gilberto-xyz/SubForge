@@ -30,6 +30,15 @@ Uso recomendado cuando ya tienes archivos de video y quieres dejarlos limpios y 
 - Genera versión filtrada (nombre con ` (filtered)`), en raíz o carpeta `filtrados`.
 - Renombra metadatos de audio/subs y título de segmento con tu marca (`--brand`).
 - Prioriza audio/subtítulos en español según su heurística interna.
+- Muestra advertencia visual (Rich) cuando la salida queda sin subtítulos en español.
+  - Caso 1: el archivo no trae subtítulos.
+  - Caso 2: trae subtítulos, pero ninguno en español.
+  - Caso 3: trae subtítulos en español, pero no quedaron seleccionados.
+- Valida archivo en uso (`WinError 32`) y puede intentar desbloquear automáticamente:
+  - `--file-in-use-action close-qbittorrent` (default): cierra qBittorrent y reintenta.
+  - `--file-in-use-action remove-torrent`: borra torrent por WebUI y reintenta.
+  - `--file-in-use-action remove-torrent-and-data`: borra torrent y datos por WebUI.
+  - `--file-in-use-action skip`: no desbloquea, solo omite.
 
 Comandos:
 
@@ -37,6 +46,7 @@ Comandos:
 python .\limpiar_tracks.py
 python .\limpiar_tracks.py "D:\Videos\Anime" -b "GDriveLatinoHD"
 python .\limpiar_tracks.py "archivo.mkv" -v
+python .\limpiar_tracks.py "archivo.mkv" --file-in-use-action remove-torrent --qb-user admin --qb-pass 123456
 ```
 
 ### 2) `convertir_mp4_a_mkv.py`

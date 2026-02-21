@@ -27,6 +27,10 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.parse
+import urllib.request
+from http.cookiejar import CookieJar
 from typing import Callable, Dict, List, Tuple
 
 # Barra de progreso (opcional)
@@ -40,6 +44,14 @@ try:
     import colorama  # type: ignore
 except Exception:  # pragma: no cover
     colorama = None  # type: ignore
+
+# Salida rica (opcional)
+try:
+    from rich.console import Console  # type: ignore
+    from rich.panel import Panel  # type: ignore
+except Exception:  # pragma: no cover
+    Console = None  # type: ignore
+    Panel = None  # type: ignore
 
 def _enable_windows_ansi() -> bool:
     if os.name != "nt":
@@ -78,6 +90,7 @@ ANSI_CYAN = "\x1b[36m"
 ANSI_MAGENTA = "\x1b[35m"
 ANSI_RED = "\x1b[31m"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+RICH_CONSOLE = Console(stderr=True) if Console is not None else None
 
 ###############################################################################
 # Configuración
@@ -93,6 +106,9 @@ ORIGINALS_FOLDER = "ORIGINAL"
 DEFAULT_BRAND = "GDriveLatinoHD"  # texto a insertar en nombres de pista
 
 PROGRESS_RE = re.compile(r"(\d{1,3})%")
+DEFAULT_LOCK_ACTION = "close-qbittorrent"
+DEFAULT_LOCK_RETRY_SECONDS = 8
+DEFAULT_QB_URL = "http://127.0.0.1:8080"
 
 
 def _color(text: str, color: str) -> str:
@@ -479,6 +495,212 @@ def select_tracks_fast(audio: List[TrackInfo], subs: List[TrackInfo]):
     return a_ids, s_ids, audio_default_id, sub_default_id
 
 
+def _format_warning_panel(title: str, lines: List[str]) -> None:
+    body = "\n".join(lines)
+    if RICH_CONSOLE is not None and Panel is not None:
+        RICH_CONSOLE.print(
+            Panel.fit(
+                body,
+                title=f"[bold yellow]{title}[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+        return
+    logging.warning("%s | %s", title, " | ".join(lines))
+
+
+def spanish_subtitle_warning(
+    file_name: str,
+    audios: List[TrackInfo],
+    subs: List[TrackInfo],
+    selected_sub_ids: List[str],
+) -> List[str]:
+    """Devuelve líneas de advertencia cuando no hay subs en español en la salida."""
+    selected_ids = {str(sid) for sid in selected_sub_ids}
+    spa_in_source = [s for s in subs if str(s.get("lang", "")) == "spa"]
+    spa_in_selected = [
+        s
+        for s in subs
+        if str(s.get("lang", "")) == "spa" and str(s.get("id", "")) in selected_ids
+    ]
+    has_audio_spa = any(str(a.get("lang", "")) == "spa" for a in audios)
+    und_sub_count = sum(1 for s in subs if str(s.get("lang", "")) == "und")
+
+    if spa_in_selected:
+        return []
+
+    lines: List[str] = [f"Archivo: {file_name}"]
+    if not subs:
+        lines.append("No se encontraron pistas de subtítulos en el archivo.")
+    elif not spa_in_source:
+        lines.append("No se detectaron subtítulos en español (spa/es) en el origen.")
+    else:
+        lines.append("Se detectaron subtítulos en español, pero ninguno quedó en la salida final.")
+
+    if has_audio_spa:
+        lines.append("Audio español: sí.")
+    else:
+        lines.append("Audio español: no (esto no bloquea el proceso).")
+
+    if und_sub_count > 0:
+        lines.append(f"Subtítulos con idioma indefinido (und): {und_sub_count}.")
+    lines.append(f"Subtítulos seleccionados para mux: {len(selected_sub_ids)}.")
+    return lines
+
+
+def _is_file_in_use_error(exc: BaseException) -> bool:
+    if not isinstance(exc, PermissionError):
+        return False
+    if getattr(exc, "winerror", None) == 32:
+        return True
+    return "WinError 32" in str(exc)
+
+
+class QBittorrentWebClient:
+    def __init__(self, base_url: str, username: str, password: str, timeout: int = 10) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _post(self, path: str, payload: Dict[str, str]) -> str:
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url=f"{self.base_url}{path}",
+            data=data,
+            method="POST",
+            headers={"User-Agent": "SubForge/1.0"},
+        )
+        with self.opener.open(req, timeout=self.timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    def _get_json(self, path: str) -> object:
+        req = urllib.request.Request(
+            url=f"{self.base_url}{path}",
+            method="GET",
+            headers={"User-Agent": "SubForge/1.0"},
+        )
+        with self.opener.open(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def login(self) -> None:
+        out = self._post(
+            "/api/v2/auth/login",
+            {"username": self.username, "password": self.password},
+        )
+        if "Ok." not in out:
+            raise RuntimeError("qBittorrent WebUI login failed")
+
+    def _torrent_matches_path(self, torrent: Dict[str, object], file_path: pathlib.Path) -> bool:
+        target = os.path.normcase(os.path.normpath(str(file_path.resolve())))
+        name = str(torrent.get("name") or "")
+        content_path = str(torrent.get("content_path") or "")
+        save_path = str(torrent.get("save_path") or "")
+
+        candidates: List[str] = []
+        if content_path:
+            candidates.append(content_path)
+        if save_path and name:
+            candidates.append(os.path.join(save_path, name))
+        if name:
+            candidates.append(name)
+
+        for c in candidates:
+            norm_c = os.path.normcase(os.path.normpath(c))
+            if norm_c == target:
+                return True
+            if os.path.basename(norm_c) == os.path.normcase(file_path.name):
+                return True
+            if target.startswith(norm_c + os.sep):
+                return True
+        return False
+
+    def find_hashes_by_file(self, file_path: pathlib.Path) -> List[str]:
+        data = self._get_json("/api/v2/torrents/info?filter=all")
+        if not isinstance(data, list):
+            return []
+        hashes: List[str] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            if self._torrent_matches_path(row, file_path):
+                h = str(row.get("hash") or "").strip()
+                if h:
+                    hashes.append(h)
+        return hashes
+
+    def delete_torrents(self, hashes: List[str], delete_files: bool) -> None:
+        if not hashes:
+            return
+        self._post(
+            "/api/v2/torrents/delete",
+            {
+                "hashes": "|".join(hashes),
+                "deleteFiles": "true" if delete_files else "false",
+            },
+        )
+
+
+def _close_qbittorrent_process() -> Tuple[bool, str]:
+    if os.name == "nt":
+        cmd = ["taskkill", "/IM", "qbittorrent.exe", "/F"]
+    else:
+        cmd = ["pkill", "-f", "qbittorrent"]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    msg = (proc.stdout or "") + (proc.stderr or "")
+    msg_l = msg.lower()
+    if proc.returncode == 0:
+        return True, "qBittorrent cerrado correctamente."
+    if "not found" in msg_l or "no se está ejecutando ninguna instancia" in msg_l:
+        return True, "qBittorrent no estaba en ejecución (se continuará con reintento)."
+    return False, msg.strip() or "No se pudo cerrar qBittorrent."
+
+
+def try_release_locked_file(
+    file_path: pathlib.Path,
+    *,
+    action: str,
+    qb_url: str,
+    qb_user: str | None,
+    qb_pass: str | None,
+) -> Tuple[bool, List[str]]:
+    details = [f"Archivo bloqueado: {file_path}"]
+    if action == "skip":
+        details.append("Acción configurada: skip (se omite desbloqueo automático).")
+        return False, details
+
+    if action == "close-qbittorrent":
+        ok, close_msg = _close_qbittorrent_process()
+        details.append("Acción: cerrar qBittorrent.")
+        details.append(f"Resultado: {close_msg}")
+        return ok, details
+
+    delete_files = action == "remove-torrent-and-data"
+    if not qb_user or not qb_pass:
+        details.append("Acción: borrar torrent.")
+        details.append("Falta configuración WebUI: usa --qb-user y --qb-pass.")
+        return False, details
+
+    try:
+        client = QBittorrentWebClient(qb_url, qb_user, qb_pass)
+        client.login()
+        hashes = client.find_hashes_by_file(file_path)
+        if not hashes:
+            details.append("Acción: borrar torrent.")
+            details.append("No se encontró torrent asociado a este archivo.")
+            return False, details
+        client.delete_torrents(hashes, delete_files=delete_files)
+        details.append(
+            f"Acción: borrar torrent ({'con datos' if delete_files else 'sin borrar datos'})."
+        )
+        details.append(f"Torrents eliminados: {len(hashes)}.")
+        return True, details
+    except Exception as exc:
+        details.append(f"Error al operar con qBittorrent WebUI: {exc}")
+        return False, details
+
+
 def run_mkvmerge(
     src: pathlib.Path,
     dst: pathlib.Path,
@@ -662,8 +884,13 @@ def process_video(
     path: pathlib.Path,
     workdir: pathlib.Path,
     output_in_root: bool,
+    file_in_use_action: str,
+    lock_retry_seconds: int,
+    qb_url: str,
+    qb_user: str | None,
+    qb_pass: str | None,
     progress_cb: Callable[[int], None] | None = None,
-) -> Tuple[pathlib.Path | None, str]:
+) -> Tuple[pathlib.Path | None, str, List[str]]:
     """Filtra pistas como el script base y devuelve el destino (sin renombrar metadatos)."""
     originals = workdir / ORIGINALS_FOLDER
     originals.mkdir(exist_ok=True)
@@ -672,7 +899,42 @@ def process_video(
     original_dest = originals / path.name
     if path.parent != originals:
         if not original_dest.exists():
-            shutil.move(path, original_dest)  # type: ignore[arg-type]
+            try:
+                shutil.move(path, original_dest)  # type: ignore[arg-type]
+            except PermissionError as exc:
+                if not _is_file_in_use_error(exc):
+                    raise
+                _format_warning_panel(
+                    "Archivo en uso",
+                    [
+                        f"Archivo: {path}",
+                        "No se puede mover porque está en uso (WinError 32).",
+                    ],
+                )
+                released, details = try_release_locked_file(
+                    path,
+                    action=file_in_use_action,
+                    qb_url=qb_url,
+                    qb_user=qb_user,
+                    qb_pass=qb_pass,
+                )
+                _format_warning_panel("Desbloqueo automático", details)
+                if not released:
+                    return None, "locked", []
+                time.sleep(max(1, int(lock_retry_seconds)))
+                try:
+                    shutil.move(path, original_dest)  # type: ignore[arg-type]
+                except PermissionError as retry_exc:
+                    if _is_file_in_use_error(retry_exc):
+                        _format_warning_panel(
+                            "Archivo en uso",
+                            [
+                                f"Archivo: {path}",
+                                "Sigue bloqueado tras intento de desbloqueo automático.",
+                            ],
+                        )
+                        return None, "locked", []
+                    raise
         src = original_dest
     else:
         src = path
@@ -702,9 +964,10 @@ def process_video(
         sub_es_forzado_id,
         progress_cb=progress_cb,
     )
+    warning_lines = spanish_subtitle_warning(src.name, a_tracks, s_tracks, s_ids)
     if not ok:
-        return None, "error"
-    return dst, "filtrado"
+        return None, "error", warning_lines
+    return dst, "filtrado", warning_lines
 
 
 def setup_logging(verbose: bool = False):
@@ -724,6 +987,28 @@ def main():
     parser.add_argument("ruta", nargs="?", default=".", help="Archivo o carpeta a procesar")
     parser.add_argument("-b", "--brand", default=DEFAULT_BRAND, help="Texto de marca a añadir, p.ej. 'GDriveLatinoHD'")
     parser.add_argument("-v", "--verbose", action="store_true", help="Salida detallada")
+    parser.add_argument(
+        "--file-in-use-action",
+        choices=["skip", "close-qbittorrent", "remove-torrent", "remove-torrent-and-data"],
+        default=DEFAULT_LOCK_ACTION,
+        help=(
+            "Acción cuando el archivo está bloqueado (WinError 32). "
+            "Por defecto cierra qBittorrent."
+        ),
+    )
+    parser.add_argument(
+        "--lock-retry-seconds",
+        type=int,
+        default=DEFAULT_LOCK_RETRY_SECONDS,
+        help="Segundos de espera tras desbloqueo antes de reintentar mover el archivo.",
+    )
+    parser.add_argument(
+        "--qb-url",
+        default=DEFAULT_QB_URL,
+        help="URL WebUI de qBittorrent para acciones remove-torrent.",
+    )
+    parser.add_argument("--qb-user", default=None, help="Usuario WebUI de qBittorrent.")
+    parser.add_argument("--qb-pass", default=None, help="Password WebUI de qBittorrent.")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -807,10 +1092,15 @@ def main():
             elif args.verbose:
                 print(f"    {_color('Progreso mux', ANSI_MAGENTA)}: {pct}%")
 
-        dst, status = process_video(
+        dst, status, warning_lines = process_video(
             f,
             workdir=workdir,
             output_in_root=output_in_root,
+            file_in_use_action=args.file_in_use_action,
+            lock_retry_seconds=max(1, int(args.lock_retry_seconds)),
+            qb_url=args.qb_url,
+            qb_user=args.qb_user,
+            qb_pass=args.qb_pass,
             progress_cb=_mux_progress,
         )
         if mux_pbar:
@@ -821,12 +1111,17 @@ def main():
         if status != "filtrado" or not dst:
             if args.verbose or not pbar:
                 print(f"    {_color('Error', ANSI_RED)} al filtrar: {name}")
+            if warning_lines:
+                _format_warning_panel("Advertencia de subtítulos", warning_lines)
             # aún contamos paso de rename para no desbalancear la barra
             if pbar:
                 if use_tqdm:
                     pbar.set_description(_color(f"Meta: {name[:40]}", ANSI_CYAN))
                 pbar.update(1)
             continue
+
+        if warning_lines:
+            _format_warning_panel("Advertencia de subtítulos", warning_lines)
 
         # Renombrar metadatos (solo MKV/WEBM)
         rename_ok = True
