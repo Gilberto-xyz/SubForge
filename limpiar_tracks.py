@@ -885,6 +885,7 @@ def process_video(
     workdir: pathlib.Path,
     output_in_root: bool,
     file_in_use_action: str,
+    delete_originals: bool,
     lock_retry_seconds: int,
     qb_url: str,
     qb_user: str | None,
@@ -967,6 +968,17 @@ def process_video(
     warning_lines = spanish_subtitle_warning(src.name, a_tracks, s_tracks, s_ids)
     if not ok:
         return None, "error", warning_lines
+
+    if delete_originals and src.exists() and src.parent == originals:
+        try:
+            src.unlink()
+            try:
+                originals.rmdir()
+            except OSError:
+                pass
+        except OSError as exc:
+            logging.warning("No se pudo eliminar el original movido %s: %s", src, exc)
+
     return dst, "filtrado", warning_lines
 
 
@@ -1009,6 +1021,11 @@ def main():
     )
     parser.add_argument("--qb-user", default=None, help="Usuario WebUI de qBittorrent.")
     parser.add_argument("--qb-pass", default=None, help="Password WebUI de qBittorrent.")
+    parser.add_argument(
+        "--delete-originals",
+        action="store_true",
+        help="Elimina los archivos originales movidos a la carpeta ORIGINAL cuando el filtrado termina bien.",
+    )
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -1097,6 +1114,7 @@ def main():
             workdir=workdir,
             output_in_root=output_in_root,
             file_in_use_action=args.file_in_use_action,
+            delete_originals=args.delete_originals,
             lock_retry_seconds=max(1, int(args.lock_retry_seconds)),
             qb_url=args.qb_url,
             qb_user=args.qb_user,
