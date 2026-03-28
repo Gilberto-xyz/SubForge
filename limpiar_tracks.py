@@ -946,6 +946,12 @@ def process_video(
 
     # Selección (automática fast)
     a_ids, s_ids, audio_es_id, sub_es_forzado_id = select_tracks_fast(a_tracks, s_tracks)
+    allow_delete_originals = delete_originals and len(a_tracks) > 1
+    if delete_originals and not allow_delete_originals:
+        logging.info(
+            "%s: se omite eliminar el original porque el archivo solo tiene una pista de audio.",
+            src.name,
+        )
 
     # Destino filtrado
     if output_in_root:
@@ -969,7 +975,7 @@ def process_video(
     if not ok:
         return None, "error", warning_lines
 
-    if delete_originals and src.exists() and src.parent == originals:
+    if allow_delete_originals and src.exists() and src.parent == originals:
         try:
             src.unlink()
             try:
