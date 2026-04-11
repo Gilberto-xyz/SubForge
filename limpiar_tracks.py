@@ -71,17 +71,26 @@ def _enable_windows_ansi() -> bool:
         return False
 
 
-COLOR_ENABLED = False
-if colorama:
+def _stream_is_tty(stream) -> bool:
     try:
-        colorama.just_fix_windows_console()
-        COLOR_ENABLED = True
+        return bool(stream is not None and hasattr(stream, "isatty") and stream.isatty())
     except Exception:
-        COLOR_ENABLED = False
-elif os.name != "nt":
-    COLOR_ENABLED = True
-else:
-    COLOR_ENABLED = _enable_windows_ansi()
+        return False
+
+
+COLOR_ENABLED = False
+HAS_TTY_OUTPUT = _stream_is_tty(sys.stdout) or _stream_is_tty(sys.stderr)
+if HAS_TTY_OUTPUT:
+    if colorama:
+        try:
+            colorama.just_fix_windows_console()
+            COLOR_ENABLED = True
+        except Exception:
+            COLOR_ENABLED = False
+    elif os.name != "nt":
+        COLOR_ENABLED = True
+    else:
+        COLOR_ENABLED = _enable_windows_ansi()
 
 ANSI_RESET = "\x1b[0m"
 ANSI_GREEN = "\x1b[32m"
@@ -210,6 +219,8 @@ FORCED_NAME_HINTS = (
 # Idiomas permitidos como en el script base
 ALLOWED_LANGS = {"spa", "eng", "jpn", "zho", "chi"}
 # ALLOWED_LANGS = {"kor"}
+AUDIO_BASE_LANGS = {"spa", "eng"}
+PROGRESS_MILESTONES = (10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
 
 # Heurística para preferir LATAM cuando sea posible
 SPANISH_NAME_HINTS = (
@@ -422,45 +433,131 @@ def parse_tracks_full(info_json: str):
     return videos, audios, subs
 
 
-def select_tracks_fast(audio: List[TrackInfo], subs: List[TrackInfo]):
-    """Selección automática con preferencia a es-419 para subtítulos."""
-    a_allowed = [t for t in audio if t["lang"] in ALLOWED_LANGS or t["lang"] == "und"]
-    s_allowed = [t for t in subs if t["lang"] in ALLOWED_LANGS or t["lang"] == "und"]
+def inspect_tracks(path: pathlib.Path):
+    info_json = subprocess.check_output(
+        [_resolve_bin(MKVMERGE, "mkvmerge"), "-J", str(path)],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return parse_tracks_full(info_json)
 
-    a_ids = [t["id"] for t in a_allowed]
 
-    def _is_es419(tr: TrackInfo) -> bool:
-        lietf = str(tr.get("lang_ietf") or "").lower()
-        lraw = str(tr.get("lang_raw") or "").lower()
-        return lietf.startswith("es-419") or lraw.startswith("es-419")
+def _track_id(track: TrackInfo) -> str:
+    return str(track.get("id", ""))
 
-    audio_es = [t for t in a_allowed if t["lang"] == "spa"]
-    if audio_es:
-        es419_a = [t for t in audio_es if _is_es419(t)]
-        if es419_a:
-            audio_default = next((t for t in es419_a if t.get("default")), es419_a[0])
-        else:
-            latam = [t for t in audio_es if any(h in (t.get("name") or "").lower() for h in SPANISH_NAME_HINTS)]
-            if latam:
-                audio_default = next((t for t in latam if t.get("default")), latam[0])
-            else:
-                audio_default = next((t for t in audio_es if t.get("default")), audio_es[0])
+
+def _is_es419_track(tr: TrackInfo) -> bool:
+    lietf = str(tr.get("lang_ietf") or "").lower()
+    lraw = str(tr.get("lang_raw") or "").lower()
+    return lietf.startswith("es-419") or lraw.startswith("es-419")
+
+
+def _pick_preferred_spanish_audio(audio: List[TrackInfo]) -> TrackInfo | None:
+    audio_es = [t for t in audio if t["lang"] == "spa"]
+    if not audio_es:
+        return None
+
+    es419_a = [t for t in audio_es if _is_es419_track(t)]
+    if es419_a:
+        return next((t for t in es419_a if t.get("default")), es419_a[0])
+
+    latam = [
+        t
+        for t in audio_es
+        if any(h in (t.get("name") or "").lower() for h in SPANISH_NAME_HINTS)
+    ]
+    if latam:
+        return next((t for t in latam if t.get("default")), latam[0])
+
+    return next((t for t in audio_es if t.get("default")), audio_es[0])
+
+
+def select_audio_tracks(audio: List[TrackInfo]) -> Tuple[List[TrackInfo], str | None]:
+    """Conserva audios base (spa/eng) y respeta siempre el audio original por defecto."""
+    if not audio:
+        return [], None
+
+    source_default = next((t for t in audio if t.get("default")), None)
+    keep_ids = {
+        _track_id(t)
+        for t in audio
+        if str(t.get("lang", "")).lower() in AUDIO_BASE_LANGS
+    }
+
+    if source_default is not None:
+        keep_ids.add(_track_id(source_default))
+
+    if not keep_ids:
+        keep_ids.add(_track_id(source_default or audio[0]))
+
+    selected_audio = [t for t in audio if _track_id(t) in keep_ids]
+    if not selected_audio:
+        selected_audio = [source_default or audio[0]]
+
+    if source_default is not None and any(_track_id(t) == _track_id(source_default) for t in selected_audio):
+        audio_default = source_default
     else:
-        audio_default = next((t for t in a_allowed if t.get("default")), (a_allowed[0] if a_allowed else None))
+        audio_default = _pick_preferred_spanish_audio(selected_audio)
+        if audio_default is None:
+            audio_default = next((t for t in selected_audio if t.get("default")), selected_audio[0])
 
-    audio_default_id = audio_default["id"] if audio_default else None
+    return selected_audio, (_track_id(audio_default) if audio_default is not None else None)
+
+
+def summarize_audio_selection(audio: List[TrackInfo], selected_audio_ids: List[str], audio_default_id: str | None) -> str:
+    selected_set = {str(track_id) for track_id in selected_audio_ids}
+    labels: List[str] = []
+    for track in audio:
+        track_id = _track_id(track)
+        if track_id not in selected_set:
+            continue
+        lang = str(track.get("lang") or "und").upper()
+        name = str(track.get("name") or "").strip()
+        flags: List[str] = []
+        if track_id == str(audio_default_id):
+            flags.append("default")
+        elif track.get("default"):
+            flags.append("source-default")
+
+        label = lang
+        if name:
+            label += f": {name}"
+        if flags:
+            label += f" ({', '.join(flags)})"
+        labels.append(label)
+
+    return ", ".join(labels) if labels else "sin pistas"
+
+
+def select_tracks_fast(audio: List[TrackInfo], subs: List[TrackInfo]):
+    """Conserva ES/EN, respeta el audio default original y preserva subs prioritarios."""
+    selected_audio, audio_default_id = select_audio_tracks(audio)
+    a_ids = [t["id"] for t in selected_audio]
+    selected_audio_langs = {
+        str(t.get("lang", "")).lower()
+        for t in selected_audio
+        if str(t.get("lang", "")).lower() not in {"", "und"}
+    }
+    s_allowed = [
+        t
+        for t in subs
+        if t["lang"] in ALLOWED_LANGS or t["lang"] == "und" or str(t["lang"]).lower() in selected_audio_langs
+    ]
+
+    audio_default = next((t for t in selected_audio if _track_id(t) == str(audio_default_id)), None)
     audio_default_is_spanish = bool(audio_default and audio_default["lang"] == "spa")
 
     sub_default_id = None
     if audio_default_is_spanish:
         spa_forced = [t for t in s_allowed if t["lang"] == "spa" and t["forced"]]
         s_ids = [t["id"] for t in spa_forced]
-        spa_forced_es419 = [t for t in spa_forced if _is_es419(t)]
+        spa_forced_es419 = [t for t in spa_forced if _is_es419_track(t)]
         sub_default_id = (spa_forced_es419[0]["id"] if spa_forced_es419 else (spa_forced[0]["id"] if spa_forced else None))
     else:
         spa_normal = [t for t in s_allowed if t["lang"] == "spa" and not t["forced"]]
         if spa_normal:
-            es419_normal = [t for t in spa_normal if _is_es419(t)]
+            es419_normal = [t for t in spa_normal if _is_es419_track(t)]
             if es419_normal:
                 pool = es419_normal
             else:
@@ -483,8 +580,12 @@ def select_tracks_fast(audio: List[TrackInfo], subs: List[TrackInfo]):
         seen = set(s_ids)
         s_ids.extend(i for i in eng_sub_ids if i not in seen and not seen.add(i))
 
-    # Mantener subs de los mismos idiomas que audios permitidos
-    a_langs_keep = {t["lang"] for t in a_allowed if t["lang"] in ALLOWED_LANGS}
+    # Mantener subs de los mismos idiomas que los audios realmente conservados.
+    a_langs_keep = {
+        str(t["lang"]).lower()
+        for t in selected_audio
+        if str(t["lang"]).lower() not in {"", "und"}
+    }
     extra_sub_ids = [t["id"] for t in s_allowed if t["lang"] in a_langs_keep]
     if s_ids:
         seen = set(s_ids)
@@ -707,8 +808,8 @@ def run_mkvmerge(
     video_ids: List[str],
     audio_ids: List[str],
     sub_ids: List[str],
-    audio_es_id: str | None = None,
-    sub_es_forzado_id: str | None = None,
+    audio_default_id: str | None = None,
+    sub_default_id: str | None = None,
     progress_cb: Callable[[int], None] | None = None,
 ) -> bool:
     cmd = [_resolve_bin(MKVMERGE, "mkvmerge"), "--no-global-tags", "-o", str(dst)]
@@ -717,13 +818,13 @@ def run_mkvmerge(
     if audio_ids:
         cmd += ["-a", ",".join(str(i) for i in audio_ids)]
         for aid in audio_ids:
-            cmd += ["--default-track-flag", f"{aid}:{'yes' if aid == audio_es_id else 'no'}"]
+            cmd += ["--default-track-flag", f"{aid}:{'yes' if aid == audio_default_id else 'no'}"]
     else:
         cmd.append("--no-audio")
     if sub_ids:
         cmd += ["-s", ",".join(str(i) for i in sub_ids)]
         for sid in sub_ids:
-            cmd += ["--default-track-flag", f"{sid}:{'yes' if sid == sub_es_forzado_id else 'no'}"]
+            cmd += ["--default-track-flag", f"{sid}:{'yes' if sid == sub_default_id else 'no'}"]
     else:
         cmd.append("--no-subtitles")
     cmd.append(str(src))
@@ -941,11 +1042,16 @@ def process_video(
         src = path
 
     # Inspeccionar
-    info_json = subprocess.check_output([_resolve_bin(MKVMERGE, "mkvmerge"), "-J", str(src)], text=True, encoding="utf-8", errors="replace")
-    v_tracks, a_tracks, s_tracks = parse_tracks_full(info_json)
+    v_tracks, a_tracks, s_tracks = inspect_tracks(src)
 
     # Selección (automática fast)
-    a_ids, s_ids, audio_es_id, sub_es_forzado_id = select_tracks_fast(a_tracks, s_tracks)
+    a_ids, s_ids, audio_default_id, sub_default_id = select_tracks_fast(a_tracks, s_tracks)
+    logging.info(
+        "%s: audios conservados -> %s",
+        src.name,
+        summarize_audio_selection(a_tracks, [str(track_id) for track_id in a_ids], audio_default_id),
+    )
+
     allow_delete_originals = delete_originals and len(a_tracks) > 1
     if delete_originals and not allow_delete_originals:
         logging.info(
@@ -967,13 +1073,61 @@ def process_video(
         [t["id"] for t in v_tracks],
         a_ids,
         s_ids,
-        audio_es_id,
-        sub_es_forzado_id,
+        audio_default_id,
+        sub_default_id,
         progress_cb=progress_cb,
     )
     warning_lines = spanish_subtitle_warning(src.name, a_tracks, s_tracks, s_ids)
     if not ok:
         return None, "error", warning_lines
+
+    if a_tracks:
+        _, output_audio_tracks, _ = inspect_tracks(dst)
+        if not output_audio_tracks:
+            logging.warning(
+                "%s: la salida quedó sin audio. Reintentando en modo seguro conservando todos los audios del origen.",
+                src.name,
+            )
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+
+            fallback_audio_ids = [t["id"] for t in a_tracks]
+            fallback_audio_default_id = (
+                next((_track_id(t) for t in a_tracks if t.get("default")), None)
+                or _track_id(a_tracks[0])
+            )
+            ok = run_mkvmerge(
+                src,
+                dst,
+                [t["id"] for t in v_tracks],
+                fallback_audio_ids,
+                s_ids,
+                fallback_audio_default_id,
+                sub_default_id,
+                progress_cb=progress_cb,
+            )
+            if not ok:
+                return None, "error", warning_lines
+
+            _, output_audio_tracks, _ = inspect_tracks(dst)
+            if not output_audio_tracks:
+                warning_lines = list(warning_lines)
+                warning_lines.append(
+                    "La validación final detectó una salida sin audio; se abortó el archivo."
+                )
+                logging.error("%s: validación final falló; la salida sigue sin audio.", src.name)
+                try:
+                    dst.unlink()
+                except OSError:
+                    pass
+                return None, "error", warning_lines
+
+            logging.info(
+                "%s: reintento de seguridad OK; se conservaron todos los audios del origen.",
+                src.name,
+            )
 
     if allow_delete_originals and src.exists() and src.parent == originals:
         try:
@@ -997,7 +1151,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Filtra pistas como el script base y luego renombra metadatos.\n"
-            "- Filtrado: misma lógica (prioridad español y forzados).\n"
+            "- Filtrado: conserva ES/EN, respeta el audio default original y evita salidas sin audio.\n"
             "- Renombrado: normaliza language y nombra pistas con la marca."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1058,62 +1212,18 @@ def main():
     # Política de salida: si solo 1 archivo => raíz; si más de 2 => carpeta
     output_in_root = total_files <= 2
 
-    steps_total = total_files  # avance global por archivo
-    use_tqdm = bool(tqdm)
-    if use_tqdm and hasattr(sys.stderr, "isatty") and not sys.stderr.isatty():
-        use_tqdm = False
-    tqdm_colour_ok = _tqdm_supports_colour() if use_tqdm else False
-    pbar_kwargs = {"colour": "cyan"} if tqdm_colour_ok else {}
-    if use_tqdm:
-        pbar = tqdm(
-            total=steps_total,
-            desc=_color("Global", ANSI_CYAN),
-            unit="archivo",
-            **pbar_kwargs,
-        )
-    else:
-        pbar = SimpleBar(
-            total=steps_total,
-            desc=_color("Global", ANSI_CYAN),
-            unit="archivo",
-            inplace=False,
-            show_count=True,
-        )
-        pbar.refresh()
-
     ok_total = 0
     for idx, f in enumerate(files, start=1):
         name = f.name
-        if args.verbose or not pbar:
-            print(f"[{idx}/{total_files}] {_color('Mux', ANSI_MAGENTA)}: {name}")
-        if pbar and use_tqdm:
-            pbar.set_description(_color(f"Mux: {name[:40]}", ANSI_CYAN))
-
-        mux_pbar = None
-        if use_tqdm:
-            mux_kwargs = {"colour": "magenta"} if tqdm_colour_ok else {}
-            mux_pbar = tqdm(
-                total=100,
-                desc=_color(f"Mux: {name[:40]}", ANSI_MAGENTA),
-                unit="%",
-                leave=False,
-                **mux_kwargs,
-            )
-        else:
-            mux_pbar = SimpleBar(
-                total=100,
-                desc=_color(f"Mux: {name[:40]}", ANSI_MAGENTA),
-                unit="%",
-                inplace=True,
-                show_count=False,
-            )
+        print(f"[{idx}/{total_files}] Iniciando filtrado: {name}", flush=True)
+        reported_milestones = set()
 
         def _mux_progress(pct: int):
-            if mux_pbar:
-                mux_pbar.n = pct
-                mux_pbar.refresh()
-            elif args.verbose:
-                print(f"    {_color('Progreso mux', ANSI_MAGENTA)}: {pct}%")
+            pct = max(0, min(100, int(pct)))
+            for milestone in PROGRESS_MILESTONES:
+                if pct >= milestone and milestone not in reported_milestones:
+                    reported_milestones.add(milestone)
+                    print(f"[{idx}/{total_files}] Mux {milestone:>3}%: {name}", flush=True)
 
         dst, status, warning_lines = process_video(
             f,
@@ -1127,21 +1237,14 @@ def main():
             qb_pass=args.qb_pass,
             progress_cb=_mux_progress,
         )
-        if mux_pbar:
-            if status == "filtrado":
-                mux_pbar.n = 100
-                mux_pbar.refresh()
-            mux_pbar.close()
         if status != "filtrado" or not dst:
-            if args.verbose or not pbar:
-                print(f"    {_color('Error', ANSI_RED)} al filtrar: {name}")
+            print(f"[{idx}/{total_files}] Error filtrando: {name}", flush=True)
             if warning_lines:
                 _format_warning_panel("Advertencia de subtítulos", warning_lines)
-            # aún contamos paso de rename para no desbalancear la barra
-            if pbar:
-                if use_tqdm:
-                    pbar.set_description(_color(f"Meta: {name[:40]}", ANSI_CYAN))
-                pbar.update(1)
+            print(
+                f"[Global] {idx}/{total_files} procesados ({int((idx / total_files) * 100)}%) | OK {ok_total}",
+                flush=True,
+            )
             continue
 
         if warning_lines:
@@ -1150,30 +1253,24 @@ def main():
         # Renombrar metadatos (solo MKV/WEBM)
         rename_ok = True
         if dst.suffix.lower() in {".mkv", ".webm"}:
-            if args.verbose or not pbar:
-                print(f"[{idx}/{total_files}] {_color('Meta', ANSI_YELLOW)}: {dst.name}")
-            if pbar and use_tqdm:
-                pbar.set_description(_color(f"Meta: {dst.name[:40]}", ANSI_CYAN))
+            print(f"[{idx}/{total_files}] Renombrando metadatos: {dst.name}", flush=True)
             rename_ok = mkvpropedit_rename(dst, brand=args.brand, set_title=True, verbose=False)
         else:
             logging.info("%s: contenedor no Matroska; se omitió renombrado de metadatos.", dst.name)
-        if pbar:
-            pbar.update(1)
         ok_total += 1 if rename_ok else 0
 
-        # Notificación breve por archivo
-        msg = (
-            f"{_color('OK', ANSI_GREEN)} {dst.name}"
-            if rename_ok
-            else f"{_color('ERROR', ANSI_RED)} {dst.name}"
+        print(
+            (
+                f"[{idx}/{total_files}] OK: {dst.name}"
+                if rename_ok
+                else f"[{idx}/{total_files}] ERROR metadatos: {dst.name}"
+            ),
+            flush=True,
         )
-        if pbar and use_tqdm:
-            tqdm.write(msg)
-        else:
-            print(msg)
-
-    if pbar:
-        pbar.close()
+        print(
+            f"[Global] {idx}/{total_files} procesados ({int((idx / total_files) * 100)}%) | OK {ok_total}",
+            flush=True,
+        )
 
     print(f"Completado: {ok_total}/{total_files} archivos OK.")
 
