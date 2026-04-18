@@ -18,6 +18,7 @@ from __future__ import annotations
 ###############################################################################
 
 import argparse
+import base64
 import inspect
 import json
 import logging
@@ -337,7 +338,8 @@ def _best_ietf(lang_base: str, lang_raw: str, lang_ietf: str | None, name: str) 
         if lietf.startswith("zh-tw"):
             return "zh-TW"
         return "zh"
-    return lang_base
+
+    return _resolve_canonical_language_code(lang_ietf, lang_raw, lang_base) or lang_base
 
 
 ###############################################################################
@@ -505,6 +507,236 @@ def select_audio_tracks(audio: List[TrackInfo]) -> Tuple[List[TrackInfo], str | 
     return selected_audio, (_track_id(audio_default) if audio_default is not None else None)
 
 
+def parse_keep_track_ids(raw_value: str | None) -> List[str]:
+    if raw_value is None:
+        return []
+
+    normalized_raw = raw_value.strip()
+    if not normalized_raw or normalized_raw == "__none__":
+        return []
+
+    parts = re.split(r"[\s,]+", normalized_raw)
+    ordered: List[str] = []
+    seen = set()
+    for part in parts:
+        value = part.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _normalize_selection_lang_code(value: object | None) -> str:
+    text = str(value or "").strip().lower().replace("_", "-")
+    return text or "und"
+
+
+def _normalize_track_name_for_match(name: object | None) -> str:
+    text = str(name or "").strip().lower()
+    while text.endswith("]"):
+        updated = re.sub(r"\s*\[[^\]]+\]\s*$", "", text).strip()
+        if updated == text:
+            break
+        text = updated
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_signature_payload(raw_value: str | None) -> List[Dict[str, object]]:
+    if not raw_value:
+        return []
+    try:
+        decoded = base64.b64decode(raw_value.encode("ascii")).decode("utf-8")
+        data = json.loads(decoded)
+    except Exception as exc:
+        logging.warning("No se pudo decodificar la selección por firma: %s", exc)
+        return []
+
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+
+    signatures: List[Dict[str, object]] = []
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+
+        try:
+            order = int(item.get("order", idx))
+        except (TypeError, ValueError):
+            order = idx
+
+        language_code = _normalize_selection_lang_code(
+            item.get("languageCode") or item.get("language_code")
+        )
+        canonical_language_code = _normalize_selection_lang_code(
+            item.get("canonicalLanguageCode")
+            or item.get("canonical_language_code")
+            or _resolve_canonical_language_code(language_code)
+            or language_code
+        )
+        signatures.append(
+            {
+                "track_id": str(item.get("trackId") or item.get("track_id") or "").strip(),
+                "language_code": language_code,
+                "canonical_language_code": canonical_language_code,
+                "name": _normalize_track_name_for_match(item.get("name")),
+                "is_default": bool(item.get("isDefault") or item.get("is_default")),
+                "is_forced": bool(item.get("isForced") or item.get("is_forced")),
+                "order": order,
+            }
+        )
+
+    signatures.sort(key=lambda sig: (int(sig.get("order", 0)), str(sig.get("track_id") or "")))
+    return signatures
+
+
+def summarize_signature_selection(signatures: List[Dict[str, object]]) -> str:
+    labels: List[str] = []
+    for signature in signatures:
+        lang = (
+            _resolve_language_label(
+                str(signature.get("language_code") or ""),
+                str(signature.get("canonical_language_code") or ""),
+            )
+            or str(signature.get("language_code") or "und").upper()
+        )
+        name = str(signature.get("name") or "").strip()
+        flags: List[str] = []
+        if signature.get("is_forced"):
+            flags.append("forced")
+        if signature.get("is_default"):
+            flags.append("default")
+
+        label = lang
+        if name:
+            label += f": {name}"
+        if flags:
+            label += f" ({', '.join(flags)})"
+        labels.append(label)
+
+    return ", ".join(labels) if labels else "sin pistas"
+
+
+def _track_signature_match_score(
+    track: TrackInfo,
+    signature: Dict[str, object],
+    *,
+    is_subtitle: bool,
+) -> int | None:
+    track_lang_code = _normalize_selection_lang_code(
+        track.get("lang_ietf") or track.get("lang_raw") or track.get("lang")
+    )
+    track_canonical_lang = _normalize_selection_lang_code(
+        _resolve_canonical_language_code(
+            str(track.get("lang_ietf") or ""),
+            str(track.get("lang_raw") or ""),
+            str(track.get("lang") or ""),
+        )
+        or track_lang_code
+    )
+    desired_lang_code = _normalize_selection_lang_code(signature.get("language_code"))
+    desired_canonical_lang = _normalize_selection_lang_code(signature.get("canonical_language_code"))
+
+    if desired_lang_code != "und" and track_lang_code == desired_lang_code:
+        score = 90
+    elif desired_canonical_lang != "und" and track_canonical_lang == desired_canonical_lang:
+        score = 55
+    else:
+        return None
+
+    if is_subtitle:
+        track_forced = bool(track.get("forced"))
+        desired_forced = bool(signature.get("is_forced"))
+        if track_forced == desired_forced:
+            score += 18
+        elif desired_forced:
+            return None
+
+    desired_name = str(signature.get("name") or "")
+    track_name = _normalize_track_name_for_match(track.get("name"))
+    if desired_name:
+        if track_name == desired_name:
+            score += 24
+        elif desired_name in track_name or track_name in desired_name:
+            score += 10
+
+    if str(track.get("id") or "") == str(signature.get("track_id") or ""):
+        score += 12
+    if bool(track.get("default")) == bool(signature.get("is_default")):
+        score += 4
+    return score
+
+
+def resolve_manual_selection_by_signatures(
+    tracks: List[TrackInfo],
+    signatures: List[Dict[str, object]],
+    preferred_default_id: str | None,
+    default_signature: Dict[str, object] | None,
+    *,
+    is_subtitle: bool,
+) -> Dict[str, object] | None:
+    if not signatures:
+        return None
+
+    remaining_tracks = list(tracks)
+    selected_tracks: List[TrackInfo] = []
+    missing_signatures: List[Dict[str, object]] = []
+    remapped = False
+
+    for signature in signatures:
+        best_track = None
+        best_score = -1
+        for track in remaining_tracks:
+            score = _track_signature_match_score(track, signature, is_subtitle=is_subtitle)
+            if score is None or score <= best_score:
+                continue
+            best_score = score
+            best_track = track
+
+        if best_track is None:
+            missing_signatures.append(signature)
+            continue
+
+        remaining_tracks.remove(best_track)
+        selected_tracks.append(best_track)
+        remapped = remapped or str(best_track.get("id") or "") != str(signature.get("track_id") or "")
+
+    if not selected_tracks:
+        return None
+
+    default_track = None
+    if default_signature:
+        best_default_score = -1
+        for track in selected_tracks:
+            score = _track_signature_match_score(track, default_signature, is_subtitle=is_subtitle)
+            if score is None or score <= best_default_score:
+                continue
+            best_default_score = score
+            default_track = track
+
+    if default_track is None and preferred_default_id:
+        default_track = next(
+            (track for track in selected_tracks if str(track.get("id") or "") == str(preferred_default_id)),
+            None,
+        )
+    if default_track is None:
+        default_track = next((track for track in selected_tracks if track.get("default")), None)
+    if default_track is None and is_subtitle:
+        default_track = next((track for track in selected_tracks if track.get("forced")), None)
+    if default_track is None:
+        default_track = selected_tracks[0]
+
+    return {
+        "tracks": selected_tracks,
+        "ids": [_track_id(track) for track in selected_tracks],
+        "default_id": _track_id(default_track),
+        "missing_signatures": missing_signatures,
+        "remapped": remapped,
+    }
+
+
 def summarize_audio_selection(audio: List[TrackInfo], selected_audio_ids: List[str], audio_default_id: str | None) -> str:
     selected_set = {str(track_id) for track_id in selected_audio_ids}
     labels: List[str] = []
@@ -512,7 +744,10 @@ def summarize_audio_selection(audio: List[TrackInfo], selected_audio_ids: List[s
         track_id = _track_id(track)
         if track_id not in selected_set:
             continue
-        lang = str(track.get("lang") or "und").upper()
+        lang = (
+            _resolve_language_label(track.get("lang_ietf"), track.get("lang_raw"), track.get("lang"))
+            or str(track.get("lang") or "und").upper()
+        )
         name = str(track.get("name") or "").strip()
         flags: List[str] = []
         if track_id == str(audio_default_id):
@@ -530,10 +765,39 @@ def summarize_audio_selection(audio: List[TrackInfo], selected_audio_ids: List[s
     return ", ".join(labels) if labels else "sin pistas"
 
 
-def select_tracks_fast(audio: List[TrackInfo], subs: List[TrackInfo]):
-    """Conserva ES/EN, respeta el audio default original y preserva subs prioritarios."""
-    selected_audio, audio_default_id = select_audio_tracks(audio)
-    a_ids = [t["id"] for t in selected_audio]
+def summarize_subtitle_selection(subs: List[TrackInfo], selected_subtitle_ids: List[str], sub_default_id: str | None) -> str:
+    selected_set = {str(track_id) for track_id in selected_subtitle_ids}
+    labels: List[str] = []
+    for track in subs:
+        track_id = _track_id(track)
+        if track_id not in selected_set:
+            continue
+
+        lang = (
+            _resolve_language_label(track.get("lang_ietf"), track.get("lang_raw"), track.get("lang"))
+            or str(track.get("lang") or "und").upper()
+        )
+        name = str(track.get("name") or "").strip()
+        flags: List[str] = []
+        if track.get("forced"):
+            flags.append("forced")
+        if track_id == str(sub_default_id):
+            flags.append("default")
+        elif track.get("default"):
+            flags.append("source-default")
+
+        label = lang
+        if name:
+            label += f": {name}"
+        if flags:
+            label += f" ({', '.join(flags)})"
+        labels.append(label)
+
+    return ", ".join(labels) if labels else "sin pistas"
+
+
+def select_subtitle_tracks(selected_audio: List[TrackInfo], subs: List[TrackInfo], audio_default_id: str | None):
+    a_ids = [_track_id(t) for t in selected_audio]
     selected_audio_langs = {
         str(t.get("lang", "")).lower()
         for t in selected_audio
@@ -591,9 +855,75 @@ def select_tracks_fast(audio: List[TrackInfo], subs: List[TrackInfo]):
         seen = set(s_ids)
         s_ids.extend(i for i in extra_sub_ids if i not in seen and not seen.add(i))
     else:
-        s_ids = extra_sub_ids
+            s_ids = extra_sub_ids
 
+    return s_ids, sub_default_id
+
+
+def select_tracks_with_audio_selection(
+    selected_audio: List[TrackInfo],
+    subs: List[TrackInfo],
+    audio_default_id: str | None,
+):
+    a_ids = [_track_id(t) for t in selected_audio]
+    s_ids, sub_default_id = select_subtitle_tracks(selected_audio, subs, audio_default_id)
     return a_ids, s_ids, audio_default_id, sub_default_id
+
+
+def select_tracks_for_audio_ids(
+    audio: List[TrackInfo],
+    subs: List[TrackInfo],
+    selected_audio_ids: List[str],
+    preferred_audio_default_id: str | None = None,
+):
+    selected_set = {str(track_id) for track_id in selected_audio_ids}
+    selected_audio = [t for t in audio if _track_id(t) in selected_set]
+    if not selected_audio:
+        return [], [], None, None
+
+    audio_default = next((t for t in selected_audio if _track_id(t) == str(preferred_audio_default_id)), None)
+    if audio_default is None:
+        audio_default = next((t for t in selected_audio if t.get("default")), None)
+    if audio_default is None:
+        audio_default = _pick_preferred_spanish_audio(selected_audio)
+    if audio_default is None:
+        audio_default = selected_audio[0]
+
+    return select_tracks_with_audio_selection(
+        selected_audio,
+        subs,
+        _track_id(audio_default) if audio_default is not None else None,
+    )
+
+
+def select_subtitles_for_ids(
+    subs: List[TrackInfo],
+    selected_subtitle_ids: List[str],
+    preferred_subtitle_default_id: str | None = None,
+):
+    if not selected_subtitle_ids:
+        return [], None
+
+    selected_set = {str(track_id) for track_id in selected_subtitle_ids}
+    selected_subs = [t for t in subs if _track_id(t) in selected_set]
+    if not selected_subs:
+        return [], None
+
+    sub_default = next((t for t in selected_subs if _track_id(t) == str(preferred_subtitle_default_id)), None)
+    if sub_default is None:
+        sub_default = next((t for t in selected_subs if t.get("default")), None)
+    if sub_default is None:
+        sub_default = next((t for t in selected_subs if t.get("forced")), None)
+    if sub_default is None:
+        sub_default = selected_subs[0]
+
+    return [_track_id(t) for t in selected_subs], _track_id(sub_default)
+
+
+def select_tracks_fast(audio: List[TrackInfo], subs: List[TrackInfo]):
+    """Conserva ES/EN, respeta el audio default original y preserva subs prioritarios."""
+    selected_audio, audio_default_id = select_audio_tracks(audio)
+    return select_tracks_with_audio_selection(selected_audio, subs, audio_default_id)
 
 
 def _format_warning_panel(title: str, lines: List[str]) -> None:
@@ -879,6 +1209,159 @@ LANG_HUMAN = {
     "zho": "Chino",
 }
 
+FALLBACK_LANG_NAMES = {
+    "und": "Indefinido",
+    "zxx": "Sin contenido lingüístico",
+    "mul": "Múltiples idiomas",
+    "spa": "Español",
+    "es": "Español",
+    "es-419": "Español (Latinoamérica)",
+    "es-es": "Español (España)",
+    "eng": "Inglés",
+    "en": "Inglés",
+    "jpn": "Japonés",
+    "ja": "Japonés",
+    "zho": "Chino",
+    "zh": "Chino",
+    "chi": "Chino",
+    "fra": "Francés",
+    "fre": "Francés",
+    "fr": "Francés",
+    "deu": "Alemán",
+    "ger": "Alemán",
+    "de": "Alemán",
+    "ita": "Italiano",
+    "it": "Italiano",
+    "por": "Portugués",
+    "pt": "Portugués",
+    "rus": "Ruso",
+    "ru": "Ruso",
+    "fas": "Persa",
+    "per": "Persa",
+    "fa": "Persa",
+    "tha": "Tailandés",
+    "th": "Tailandés",
+}
+
+FALLBACK_CANONICAL_CODES = {
+    "und": "und",
+    "zxx": "zxx",
+    "mul": "mul",
+    "spa": "es",
+    "es": "es",
+    "es-419": "es-419",
+    "es-la": "es-419",
+    "es-es": "es-es",
+    "eng": "en",
+    "en": "en",
+    "jpn": "ja",
+    "ja": "ja",
+    "zho": "zh",
+    "zh": "zh",
+    "chi": "zh",
+    "fra": "fr",
+    "fre": "fr",
+    "fr": "fr",
+    "deu": "de",
+    "ger": "de",
+    "de": "de",
+    "ita": "it",
+    "it": "it",
+    "por": "pt",
+    "pt": "pt",
+    "rus": "ru",
+    "ru": "ru",
+    "fas": "fa",
+    "per": "fa",
+    "fa": "fa",
+    "tha": "th",
+    "th": "th",
+}
+
+
+def _normalize_catalog_lang_code(code: str | None) -> str:
+    if not code:
+        return "und"
+    normalized = str(code).strip().lower().replace("_", "-")
+    return normalized or "und"
+
+
+def _load_language_catalog() -> tuple[Dict[str, str], Dict[str, str]]:
+    language_names = dict(FALLBACK_LANG_NAMES)
+    canonical_codes = dict(FALLBACK_CANONICAL_CODES)
+    catalog_path = pathlib.Path(__file__).with_name("track_languages.json")
+
+    if not catalog_path.exists():
+        return language_names, canonical_codes
+
+    try:
+        raw = json.loads(catalog_path.read_text(encoding="utf-8"))
+        display_names = raw.get("displayNames", {})
+        if isinstance(display_names, dict):
+            for code, label in display_names.items():
+                if not isinstance(code, str) or not isinstance(label, str):
+                    continue
+                normalized = _normalize_catalog_lang_code(code)
+                clean_label = label.strip()
+                if normalized and clean_label:
+                    language_names[normalized] = clean_label
+
+        raw_canonical_codes = raw.get("canonicalBaseCodes", {})
+        if isinstance(raw_canonical_codes, dict):
+            for code, canonical in raw_canonical_codes.items():
+                if not isinstance(code, str) or not isinstance(canonical, str):
+                    continue
+                normalized = _normalize_catalog_lang_code(code)
+                normalized_canonical = _normalize_catalog_lang_code(canonical)
+                if normalized and normalized_canonical:
+                    canonical_codes[normalized] = normalized_canonical
+    except Exception:
+        return language_names, canonical_codes
+
+    return language_names, canonical_codes
+
+
+LANG_CATALOG_NAMES, LANG_CATALOG_CANONICAL_CODES = _load_language_catalog()
+
+
+def _resolve_language_label(*codes: str | None) -> str | None:
+    for raw_code in codes:
+        normalized = _normalize_catalog_lang_code(raw_code)
+        candidates = [
+            normalized,
+            LANG_CATALOG_CANONICAL_CODES.get(normalized),
+        ]
+
+        base_code = normalized.split("-")[0]
+        if base_code:
+            candidates.extend(
+                [
+                    base_code,
+                    LANG_CATALOG_CANONICAL_CODES.get(base_code),
+                ])
+
+        for candidate in candidates:
+            if candidate and candidate in LANG_CATALOG_NAMES:
+                return LANG_CATALOG_NAMES[candidate]
+
+    return None
+
+
+def _resolve_canonical_language_code(*codes: str | None) -> str | None:
+    for raw_code in codes:
+        normalized = _normalize_catalog_lang_code(raw_code)
+        canonical = LANG_CATALOG_CANONICAL_CODES.get(normalized)
+        if canonical:
+            return canonical
+
+        base_code = normalized.split("-")[0]
+        if base_code:
+            canonical = LANG_CATALOG_CANONICAL_CODES.get(base_code)
+            if canonical:
+                return canonical
+
+    return None
+
 
 def build_new_name(
     lang_base: str,
@@ -892,14 +1375,17 @@ def build_new_name(
     # Etiqueta humana con variantes para español
     if lang_base == "spa":
         ietf = _best_spanish_ietf(lang_raw, lang_ietf, name_hint)
-        if ietf.lower().startswith("es-419"):
-            label = "Español Latino"
-        elif ietf.lower().startswith("es-es"):
-            label = "Español España"
-        else:
-            label = LANG_HUMAN.get(lang_base, lang_base.upper())
+        label = (
+            _resolve_language_label(ietf)
+            or ("Español (Latinoamérica)" if ietf.lower().startswith("es-419")
+                else ("Español (España)" if ietf.lower().startswith("es-es")
+                      else LANG_HUMAN.get(lang_base, lang_base.upper())))
+        )
     else:
-        label = LANG_HUMAN.get(lang_base, lang_base.upper())
+        label = (
+            _resolve_language_label(lang_ietf, lang_raw, lang_base)
+            or LANG_HUMAN.get(lang_base, lang_base.upper())
+        )
 
     extra = " [Forzados]" if is_sub and forced else ""
     return f"{label}{extra} [{brand}]"
@@ -986,6 +1472,15 @@ def process_video(
     workdir: pathlib.Path,
     output_in_root: bool,
     file_in_use_action: str,
+    keep_audio_ids: List[str],
+    audio_default_id: str | None,
+    keep_audio_signatures: List[Dict[str, object]],
+    audio_default_signature: Dict[str, object] | None,
+    keep_subtitle_ids: List[str],
+    subtitle_default_id: str | None,
+    keep_subtitle_signatures: List[Dict[str, object]],
+    subtitle_default_signature: Dict[str, object] | None,
+    manual_subtitle_selection: bool,
     delete_originals: bool,
     lock_retry_seconds: int,
     qb_url: str,
@@ -1043,14 +1538,120 @@ def process_video(
 
     # Inspeccionar
     v_tracks, a_tracks, s_tracks = inspect_tracks(src)
+    selection_warning_lines: List[str] = []
 
-    # Selección (automática fast)
-    a_ids, s_ids, audio_default_id, sub_default_id = select_tracks_fast(a_tracks, s_tracks)
-    logging.info(
-        "%s: audios conservados -> %s",
-        src.name,
-        summarize_audio_selection(a_tracks, [str(track_id) for track_id in a_ids], audio_default_id),
-    )
+    manual_audio_ids = [str(track_id) for track_id in keep_audio_ids if str(track_id).strip()]
+    if manual_audio_ids:
+        audio_resolution = resolve_manual_selection_by_signatures(
+            a_tracks,
+            keep_audio_signatures,
+            audio_default_id,
+            audio_default_signature,
+            is_subtitle=False,
+        )
+        if audio_resolution is not None:
+            selected_audio_tracks = list(audio_resolution["tracks"])
+            a_ids, auto_sub_ids, audio_default_id, auto_sub_default_id = select_tracks_with_audio_selection(
+                selected_audio_tracks,
+                s_tracks,
+                str(audio_resolution["default_id"] or ""),
+            )
+            if audio_resolution.get("remapped"):
+                logging.info(
+                    "%s: audios reasignados por firma compatible -> %s",
+                    src.name,
+                    summarize_audio_selection(a_tracks, [str(track_id) for track_id in a_ids], audio_default_id),
+                )
+            missing_audio_signatures = list(audio_resolution.get("missing_signatures") or [])
+            if missing_audio_signatures:
+                selection_warning_lines.append(
+                    "Faltaron algunos audios seleccionados al resolver el caso especial por firma."
+                )
+                selection_warning_lines.append(
+                    f"Audios no encontrados: {summarize_signature_selection(missing_audio_signatures)}."
+                )
+        else:
+            a_ids, auto_sub_ids, audio_default_id, auto_sub_default_id = select_tracks_for_audio_ids(
+                a_tracks,
+                s_tracks,
+                manual_audio_ids,
+                audio_default_id,
+            )
+        if not a_ids:
+            warning_lines = [
+                f"Archivo: {src.name}",
+                "La selección manual de audios no coincide con ninguna pista del archivo.",
+                f"IDs solicitados: {', '.join(manual_audio_ids)}.",
+            ]
+            if keep_audio_signatures:
+                warning_lines.append(
+                    f"Firmas solicitadas: {summarize_signature_selection(keep_audio_signatures)}."
+                )
+            logging.error("%s: selección manual inválida de audios -> %s", src.name, ", ".join(manual_audio_ids))
+            return None, "error", warning_lines
+
+        logging.info(
+            "%s: audios conservados (selección manual) -> %s",
+            src.name,
+            summarize_audio_selection(a_tracks, [str(track_id) for track_id in a_ids], audio_default_id),
+        )
+    else:
+        # Selección automática fast
+        a_ids, auto_sub_ids, audio_default_id, auto_sub_default_id = select_tracks_fast(a_tracks, s_tracks)
+        logging.info(
+            "%s: audios conservados -> %s",
+            src.name,
+            summarize_audio_selection(a_tracks, [str(track_id) for track_id in a_ids], audio_default_id),
+        )
+
+    manual_sub_ids = [str(track_id) for track_id in keep_subtitle_ids if str(track_id).strip()]
+    if manual_subtitle_selection:
+        subtitle_resolution = resolve_manual_selection_by_signatures(
+            s_tracks,
+            keep_subtitle_signatures,
+            subtitle_default_id,
+            subtitle_default_signature,
+            is_subtitle=True,
+        )
+        if subtitle_resolution is not None:
+            s_ids = [str(track_id) for track_id in subtitle_resolution["ids"]]
+            sub_default_id = str(subtitle_resolution["default_id"] or "")
+            if subtitle_resolution.get("remapped"):
+                logging.info(
+                    "%s: subtítulos reasignados por firma compatible -> %s",
+                    src.name,
+                    summarize_subtitle_selection(s_tracks, [str(track_id) for track_id in s_ids], sub_default_id),
+                )
+            missing_subtitle_signatures = list(subtitle_resolution.get("missing_signatures") or [])
+            if missing_subtitle_signatures:
+                selection_warning_lines.append(
+                    "Faltaron algunos subtítulos seleccionados al resolver el caso especial por firma."
+                )
+                selection_warning_lines.append(
+                    f"Subtítulos no encontrados: {summarize_signature_selection(missing_subtitle_signatures)}."
+                )
+        else:
+            s_ids, sub_default_id = select_subtitles_for_ids(s_tracks, manual_sub_ids, subtitle_default_id)
+        if manual_sub_ids and not s_ids:
+            warning_lines = [
+                f"Archivo: {src.name}",
+                "La selección manual de subtítulos no coincide con ninguna pista del archivo.",
+                f"IDs solicitados: {', '.join(manual_sub_ids)}.",
+            ]
+            if keep_subtitle_signatures:
+                warning_lines.append(
+                    f"Firmas solicitadas: {summarize_signature_selection(keep_subtitle_signatures)}."
+                )
+            logging.error("%s: selección manual inválida de subtítulos -> %s", src.name, ", ".join(manual_sub_ids))
+            return None, "error", warning_lines
+
+        logging.info(
+            "%s: subtítulos conservados (selección manual) -> %s",
+            src.name,
+            summarize_subtitle_selection(s_tracks, [str(track_id) for track_id in s_ids], sub_default_id),
+        )
+    else:
+        s_ids, sub_default_id = auto_sub_ids, auto_sub_default_id
 
     allow_delete_originals = delete_originals and len(a_tracks) > 1
     if delete_originals and not allow_delete_originals:
@@ -1077,7 +1678,8 @@ def process_video(
         sub_default_id,
         progress_cb=progress_cb,
     )
-    warning_lines = spanish_subtitle_warning(src.name, a_tracks, s_tracks, s_ids)
+    warning_lines = list(selection_warning_lines)
+    warning_lines.extend(spanish_subtitle_warning(src.name, a_tracks, s_tracks, s_ids))
     if not ok:
         return None, "error", warning_lines
 
@@ -1186,6 +1788,46 @@ def main():
         action="store_true",
         help="Elimina los archivos originales movidos a la carpeta ORIGINAL cuando el filtrado termina bien.",
     )
+    parser.add_argument(
+        "--keep-audio-ids",
+        default=None,
+        help="Lista de track IDs de audio a conservar, separada por comas. Si se omite, se usa la selección automática.",
+    )
+    parser.add_argument(
+        "--audio-default-id",
+        default=None,
+        help="Track ID de audio que debe quedar como predeterminado dentro de la selección conservada.",
+    )
+    parser.add_argument(
+        "--keep-audio-signatures",
+        default=None,
+        help="Payload base64/json con firmas estables de audio para resolver lotes con layouts mixtos.",
+    )
+    parser.add_argument(
+        "--audio-default-signature",
+        default=None,
+        help="Payload base64/json con la firma del audio que debe quedar como predeterminado.",
+    )
+    parser.add_argument(
+        "--keep-subtitle-ids",
+        default=None,
+        help="Lista de track IDs de subtítulos a conservar, separada por comas. Usa __none__ para quitar todos explícitamente.",
+    )
+    parser.add_argument(
+        "--subtitle-default-id",
+        default=None,
+        help="Track ID de subtítulo que debe quedar como predeterminado dentro de la selección conservada.",
+    )
+    parser.add_argument(
+        "--keep-subtitle-signatures",
+        default=None,
+        help="Payload base64/json con firmas estables de subtítulos para resolver lotes con layouts mixtos.",
+    )
+    parser.add_argument(
+        "--subtitle-default-signature",
+        default=None,
+        help="Payload base64/json con la firma del subtítulo que debe quedar como predeterminado.",
+    )
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -1211,6 +1853,17 @@ def main():
     total_files = len(files)
     # Política de salida: si solo 1 archivo => raíz; si más de 2 => carpeta
     output_in_root = total_files <= 2
+    keep_audio_ids = parse_keep_track_ids(args.keep_audio_ids)
+    keep_subtitle_ids = parse_keep_track_ids(args.keep_subtitle_ids)
+    audio_default_id = (args.audio_default_id or "").strip() or None
+    subtitle_default_id = (args.subtitle_default_id or "").strip() or None
+    keep_audio_signatures = parse_signature_payload(args.keep_audio_signatures)
+    keep_subtitle_signatures = parse_signature_payload(args.keep_subtitle_signatures)
+    parsed_audio_default_signatures = parse_signature_payload(args.audio_default_signature)
+    parsed_subtitle_default_signatures = parse_signature_payload(args.subtitle_default_signature)
+    audio_default_signature = parsed_audio_default_signatures[0] if parsed_audio_default_signatures else None
+    subtitle_default_signature = parsed_subtitle_default_signatures[0] if parsed_subtitle_default_signatures else None
+    manual_subtitle_selection = args.keep_subtitle_ids is not None
 
     ok_total = 0
     for idx, f in enumerate(files, start=1):
@@ -1230,6 +1883,15 @@ def main():
             workdir=workdir,
             output_in_root=output_in_root,
             file_in_use_action=args.file_in_use_action,
+            keep_audio_ids=keep_audio_ids,
+            audio_default_id=audio_default_id,
+            keep_audio_signatures=keep_audio_signatures,
+            audio_default_signature=audio_default_signature,
+            keep_subtitle_ids=keep_subtitle_ids,
+            subtitle_default_id=subtitle_default_id,
+            keep_subtitle_signatures=keep_subtitle_signatures,
+            subtitle_default_signature=subtitle_default_signature,
+            manual_subtitle_selection=manual_subtitle_selection,
             delete_originals=args.delete_originals,
             lock_retry_seconds=max(1, int(args.lock_retry_seconds)),
             qb_url=args.qb_url,
