@@ -542,6 +542,27 @@ def _normalize_track_name_for_match(name: object | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _signature_value(item: Dict[str, object], *keys: str) -> object | None:
+    for key in keys:
+        if key in item:
+            return item[key]
+
+        if not key:
+            continue
+
+        pascal = key[0].upper() + key[1:]
+        if pascal in item:
+            return item[pascal]
+
+    lowered = {str(existing_key).lower(): value for existing_key, value in item.items()}
+    for key in keys:
+        lowered_key = key.lower()
+        if lowered_key in lowered:
+            return lowered[lowered_key]
+
+    return None
+
+
 def parse_signature_payload(raw_value: str | None) -> List[Dict[str, object]]:
     if not raw_value:
         return []
@@ -563,32 +584,41 @@ def parse_signature_payload(raw_value: str | None) -> List[Dict[str, object]]:
             continue
 
         try:
-            order = int(item.get("order", idx))
+            order = int(_signature_value(item, "order") or idx)
         except (TypeError, ValueError):
             order = idx
 
         language_code = _normalize_selection_lang_code(
-            item.get("languageCode") or item.get("language_code")
+            _signature_value(item, "languageCode", "language_code")
         )
         canonical_language_code = _normalize_selection_lang_code(
-            item.get("canonicalLanguageCode")
-            or item.get("canonical_language_code")
+            _signature_value(item, "canonicalLanguageCode", "canonical_language_code")
             or _resolve_canonical_language_code(language_code)
             or language_code
         )
         signatures.append(
             {
-                "track_id": str(item.get("trackId") or item.get("track_id") or "").strip(),
+                "track_id": str(_signature_value(item, "trackId", "track_id") or "").strip(),
                 "language_code": language_code,
                 "canonical_language_code": canonical_language_code,
-                "name": _normalize_track_name_for_match(item.get("name")),
-                "is_default": bool(item.get("isDefault") or item.get("is_default")),
-                "is_forced": bool(item.get("isForced") or item.get("is_forced")),
+                "name": _normalize_track_name_for_match(_signature_value(item, "name")),
+                "is_default": bool(_signature_value(item, "isDefault", "is_default")),
+                "is_forced": bool(_signature_value(item, "isForced", "is_forced")),
                 "order": order,
             }
         )
 
     signatures.sort(key=lambda sig: (int(sig.get("order", 0)), str(sig.get("track_id") or "")))
+    if signatures and all(
+        not str(signature.get("track_id") or "").strip()
+        and str(signature.get("language_code") or "und") == "und"
+        and not str(signature.get("name") or "").strip()
+        for signature in signatures
+    ):
+        logging.warning(
+            "La selección por firma se decodificó, pero no trae campos útiles (track/language/name). "
+            "Se ignorará y el filtro caerá al fallback por IDs."
+        )
     return signatures
 
 
